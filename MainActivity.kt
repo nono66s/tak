@@ -1,318 +1,374 @@
-package com.nono.sensor_log
+package com.nono.sensor_log.presentation
 
 import android.Manifest
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.location.Location
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.os.Build
 import android.os.Bundle
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.Crossfade
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.core.content.edit
-import androidx.lifecycle.ViewModel
-import com.nono.sensor_log.ui.theme.Phone_sensor_logTheme
+import androidx.wear.compose.foundation.lazy.AutoCenteringParams
+import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
+import androidx.wear.compose.foundation.lazy.items
+import androidx.wear.compose.material3.*
+import com.google.android.gms.wearable.MessageClient
+import com.google.android.gms.wearable.Wearable
+import com.nono.sensor_log.presentation.theme.Watch_sensor_logTheme
+import com.nono.sensor_log.service.SensorService
+import java.text.SimpleDateFormat
+import java.util.*
 
-class MainActivity : ComponentActivity() {
+/**
+ * MainActivity: 負責顯示使用者介面、處理權限與身分宣告。
+ * 核心傳輸邏輯已遷移至 SensorService。
+ */
+class MainActivity : ComponentActivity(), SensorEventListener {
 
-    private lateinit var viewModel: MainViewModel
-    private lateinit var controlManager: RemoteControlManager
+    // --- 系統服務 ---
+    private lateinit var sensorManager: SensorManager
+    private var offBodySensor: Sensor? = null
 
-    companion object {
-        var instance: MainActivity? = null
+    // --- UI 顯示狀態 (Compose State) ---
+    private var lastActiveSensorName by mutableStateOf("無活動")
+    private var isTransporting by mutableStateOf(false)
+    private var isDeviceWorn by mutableStateOf(false)
+    private val debugLogs = mutableStateListOf("等待連線...")
+    private var currentScreen by mutableIntStateOf(0) // 0=主頁, 1=清單, 2=除錯
+
+    // --- 訊息監聽器 (接收手機端指令) ---
+    private val onMessageReceivedListener = MessageClient.OnMessageReceivedListener { event ->
+        val msg = String(event.data, Charsets.UTF_8)
+        runOnUiThread {
+            addDebugLog("收到訊息: $msg")
+        }
     }
+
+    // ==========================================
+    // 🧬 生命週期管理 (Lifecycle)
+    // ==========================================
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        instance = this
+        
+        // 初始化系統服務
+        sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
+        offBodySensor = sensorManager.getDefaultSensor(Sensor.TYPE_LOW_LATENCY_OFFBODY_DETECT)
 
-        viewModel = MainViewModel(applicationContext)
-        controlManager = RemoteControlManager(this)
-
-        checkPermissionsAndStartService()
+        // 啟動前檢查：請求權限並宣告身分
+        checkAndRequestPermissions()
+        sendIdentityToPhone()
 
         setContent {
-            Phone_sensor_logTheme {
-                MainAppNavigation(viewModel = viewModel, onControl = controlManager)
-            }
-        }
-    }
-
-    private fun checkPermissionsAndStartService() {
-        val permissions = mutableListOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION,
-        )
-        
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-
-        val requestPermissionLauncher = registerForActivityResult(
-            ActivityResultContracts.RequestMultiplePermissions()
-        ) { perms ->
-            if (perms[Manifest.permission.ACCESS_FINE_LOCATION] == true) {
-                startSensorService()
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    checkBackgroundLocationPermission()
+            Watch_sensor_logTheme {
+                Surface(modifier = Modifier.fillMaxSize(), color = Color.Black) {
+                    Crossfade(targetState = currentScreen, label = "screen_transition") { screen ->
+                        when (screen) {
+                            0 -> MainDashboard(
+                                onNavigateToList = { currentScreen = 1 },
+                                onNavigateToDebug = { currentScreen = 2 }
+                            )
+                            1 -> SensorListScreen(onBack = { currentScreen = 0 })
+                            2 -> DebugToolsScreen(onBack = { currentScreen = 0 })
+                        }
+                    }
                 }
-            } else {
-                Toast.makeText(this, "需要定位權限以紀錄數據", Toast.LENGTH_LONG).show()
-            }
-        }
-
-        requestPermissionLauncher.launch(permissions.toTypedArray())
-    }
-
-    private fun checkBackgroundLocationPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-                Toast.makeText(this, "請在設定中將定位權限改為「始終允許」，以確保螢幕關閉時仍能紀錄。", Toast.LENGTH_LONG).show()
             }
         }
     }
 
-    private fun startSensorService() {
-        val intent = Intent(this, SensorLogService::class.java)
-        startForegroundService(intent)
+    override fun onResume() {
+        super.onResume()
+        // 註冊感測器以供介面更新 (lastActiveSensorName)
+        registerSensorsForUI()
+        Wearable.getMessageClient(this).addListener(onMessageReceivedListener)
+        
+        // 如果背景服務正在執行，同步 UI 的傳輸狀態
+        if (SensorService.isRunning) {
+            isTransporting = true
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // 介面不可見時停止介面層級的監聽，節省電力
+        Wearable.getMessageClient(this).removeListener(onMessageReceivedListener)
+        sensorManager.unregisterListener(this)
+    }
+
+    // ==========================================
+    // 🎨 介面組件 (Composables)
+    // ==========================================
+
+    @Composable
+    fun MainDashboard(onNavigateToList: () -> Unit, onNavigateToDebug: () -> Unit) {
+        ScalingLazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            contentPadding = PaddingValues(top = 40.dp, bottom = 40.dp)
+        ) {
+            // 佩戴狀態
+            item {
+                Text(
+                    text = if (isDeviceWorn) "⌚ 已佩戴手錶" else "❌ 請戴上手錶",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (isDeviceWorn) Color.Green else Color.Red
+                )
+            }
+            // 傳輸狀態
+            item {
+                Text(
+                    text = if (isTransporting) "● 數據傳輸中" else "○ 已停止傳輸",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = if (isTransporting) Color.Cyan else Color.LightGray
+                )
+            }
+            // 活躍感測器顯示
+            item {
+                Text(
+                    text = "感測器: $lastActiveSensorName",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.DarkGray,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().height(20.dp)
+                )
+            }
+            item { Spacer(modifier = Modifier.height(10.dp)) }
+            
+            // 操作按鈕：啟動/停止背景服務
+            item {
+                Button(
+                    onClick = {
+                        if (!isTransporting) {
+                            if (!isDeviceWorn) addDebugLog("警告: 未偵測到佩戴")
+                            
+                            // 啟動背景服務 (SensorService)
+                            val intent = Intent(this@MainActivity, SensorService::class.java)
+                            startForegroundService(intent)
+                            
+                            sendToPhone("LOG|WATCH_START|開始傳輸")
+                        } else {
+                            // 停止背景服務
+                            stopService(Intent(this@MainActivity, SensorService::class.java))
+                            sendToPhone("LOG|WATCH_STOP|停止傳輸")
+                        }
+                        isTransporting = !isTransporting
+                    },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isTransporting) Color(0xFFD32F2F) else Color(0xFF388E3C)
+                    )
+                ) {
+                    Text(if (isTransporting) "停止發送" else "開始發送")
+                }
+            }
+            
+            // 導航按鈕
+            item {
+                FilledTonalButton(onClick = onNavigateToList, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
+                    Text("感測器清單")
+                }
+            }
+            item {
+                FilledTonalButton(onClick = onNavigateToDebug, modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
+                    Text("通訊除錯")
+                }
+            }
+        }
     }
 
     @Composable
-    fun MainAppNavigation(viewModel: MainViewModel, onControl: RemoteControlManager) {
-        var selectedTab by remember { mutableIntStateOf(0) }
-        val titles = listOf("監控", "配對", "連線", "除錯")
-
-        Scaffold(
-            bottomBar = {
-                NavigationBar {
-                    titles.forEachIndexed { index, title ->
-                        NavigationBarItem(
-                            selected = selectedTab == index,
-                            onClick = { selectedTab = index },
-                            label = { Text(title) },
-                            icon = {
-                                Text(
-                                    text = if (selectedTab == index) "●" else "○",
-                                    color = if (selectedTab == index) MaterialTheme.colorScheme.primary else Color.Gray
-                                )
-                            }
-                        )
-                    }
-                }
-            }
-        ) { innerPadding ->
-            Box(modifier = Modifier.padding(innerPadding)) {
-                when (selectedTab) {
-                    0 -> MonitorPage(
-                        viewModel = viewModel
-                    )
-                    1 -> PairingPage()
-                    2 -> SettingsPage(viewModel = viewModel, onControl = onControl)
-                    3 -> Column(Modifier.fillMaxSize()) {
-                        var isLogExpanded by remember { mutableStateOf(false) }
-                        val scrollState = rememberScrollState()
-                        
-                        // 1. 控制工具區 (當展開時完全隱藏)
-                        if (!isLogExpanded) {
-                            Column(modifier = Modifier.weight(0.75f).verticalScroll(scrollState)) {
-                                SamsungCalibrationTool()
-
-                                PhoneDebugTool(
-                                    onSendMessage = {
-                                        onControl.sendCommand("/message_path", it)
-                                        viewModel.addDebugLog("發送指令: $it")
-                                    },
-                                    onSendRandom = {
-                                        val randomValue = (1000..9999).random()
-                                        onControl.sendCommand("/test_path", randomValue.toString())
-                                        viewModel.addDebugLog("發送隨機數據: $randomValue")
-                                    }
-                                )
-                            }
-                            HorizontalDivider(modifier = Modifier.padding(top = 8.dp), thickness = 1.dp)
-                        }
-
-                        // 2. 指令歷史標題與展開按鈕
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = "通訊指令歷史", 
-                                    style = MaterialTheme.typography.labelMedium, 
-                                    fontWeight = FontWeight.Bold, 
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                                IconButton(
-                                    onClick = { isLogExpanded = !isLogExpanded },
-                                    modifier = Modifier.size(24.dp).padding(start = 4.dp)
-                                ) {
-                                    Text(if (isLogExpanded) "🔽" else "🔼", fontSize = 12.sp)
-                                }
-                            }
-                            TextButton(onClick = { viewModel.clearDebugLogs() }) {
-                                Text("清除歷史", fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
-                            }
-                        }
-
-                        // 3. 日誌控制台 (動態調整權重：預設 25% 或展開 100%)
-                        LogConsoleView(
-                            logs = viewModel.debugLogs, 
-                            modifier = Modifier
-                                .weight(if (isLogExpanded) 1.0f else 0.25f)
-                                .padding(horizontal = 16.dp, vertical = 4.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                        )
-                        Spacer(modifier = Modifier.height(if (isLogExpanded) 0.dp else 8.dp))
-                    }
-                }
-            }
-        }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        instance = null
-    }
-}
-
-@Composable
-fun SamsungCalibrationTool() {
-    var calValue by remember { mutableStateOf(SensorDataManager.samsungRotationCalibration.value.toString()) }
-    
-    Card(
-        modifier = Modifier.fillMaxWidth().padding(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)),
-        shape = RoundedCornerShape(12.dp)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(text = "📐 Samsung 感測器校準", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
-            Text(text = "校準量將追加為 Rotation Vector 的最後一個值", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
-            
-            Spacer(modifier = Modifier.height(12.dp))
-            
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
-                    value = calValue,
-                    onValueChange = { calValue = it },
-                    label = { Text("校準補償值", fontSize = 12.sp) },
-                    modifier = Modifier.weight(1f),
-                    singleLine = true
-                )
-                
-                Spacer(modifier = Modifier.width(8.dp))
-                
-                Button(
-                    onClick = {
-                        val newValue = calValue.toFloatOrNull() ?: 0.0f
-                        SensorDataManager.samsungRotationCalibration.value = newValue
-                        SensorDataManager.addDebugLog("系統: 已將校準量設為 $newValue")
-                    },
-                    shape = RoundedCornerShape(8.dp)
+    fun SensorListScreen(onBack: () -> Unit) {
+        val allSensors = remember { sensorManager.getSensorList(Sensor.TYPE_ALL) }
+        ScalingLazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            contentPadding = PaddingValues(top = 50.dp, bottom = 45.dp),
+            autoCentering = AutoCenteringParams(itemIndex = 0)
+        ) {
+            item {
+                TextButton(
+                    onClick = onBack,
+                    modifier = Modifier.padding(bottom = 8.dp)
                 ) {
-                    Text("設定", fontSize = 12.sp)
+                    Text("← 返回", color = Color.LightGray, fontSize = 14.sp)
+                }
+            }
+            item {
+                Button(
+                    onClick = { sendSensorListToPhone() },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF388E3C)),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+                ) {
+                    Text("同步清單至手機", fontSize = 12.sp)
+                }
+            }
+            item {
+                Text(
+                    "感測器總數: ${allSensors.size}",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = Color.Yellow,
+                    modifier = Modifier.padding(vertical = 10.dp)
+                )
+            }
+            items(allSensors) { sensor ->
+                Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp).fillMaxWidth()) {
+                    Text(sensor.name, style = MaterialTheme.typography.bodySmall, color = Color.White, fontWeight = FontWeight.Bold)
+                    Text("TYPE: ${sensor.stringType.split(".").last().uppercase()}", fontSize = 10.sp, color = Color(0xFF81D4FA))
+                    HorizontalDivider(modifier = Modifier.padding(top = 4.dp), thickness = 0.5.dp, color = Color.DarkGray)
                 }
             }
         }
     }
-}
 
-@Composable
-fun LogConsoleView(logs: List<String>, modifier: Modifier = Modifier) {
-    val listState = rememberLazyListState()
-
-    LaunchedEffect(logs.size) {
-        if (logs.isNotEmpty()) listState.animateScrollToItem(logs.size - 1)
-    }
-
-    // 修改：背景改用 surfaceVariant 並加入透明度，讓它更融入主題
-    Box(modifier = modifier.background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)).padding(12.dp)) {
-        LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
-            items(logs) { log ->
-                Text(
-                    text = log,
-                    color = when {
-                        log.contains("❌") -> Color(0xFFF23F42) // Discord Red
-                        log.contains("發送") -> MaterialTheme.colorScheme.primary
-                        log.contains("✅") -> Color(0xFF23A559) // Discord Green
-                        else -> MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.padding(vertical = 2.dp)
-                )
+    @Composable
+    fun DebugToolsScreen(onBack: () -> Unit) {
+        ScalingLazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            contentPadding = PaddingValues(top = 50.dp, bottom = 45.dp),
+            autoCentering = AutoCenteringParams(itemIndex = 0)
+        ) {
+            item {
+                TextButton(onClick = onBack, modifier = Modifier.padding(bottom = 8.dp)) {
+                    Text("← 返回", color = Color.LightGray, fontSize = 14.sp)
+                }
+            }
+            item {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(modifier = Modifier.size(6.dp).background(Color.Yellow, shape = RoundedCornerShape(50)))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("手機指令紀錄", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+            item { Spacer(modifier = Modifier.height(8.dp)) }
+            items(debugLogs) { log ->
+                Box(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp)
+                    .background(Color(0xFF1A1A1A), shape = RoundedCornerShape(4.dp)).padding(6.dp)) {
+                    Text(text = log, style = MaterialTheme.typography.labelSmall,
+                        color = if (log.contains("失敗") || log.contains("❌")) Color.Red else Color.Yellow,
+                        fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+                }
+            }
+            item {
+                Button(onClick = { debugLogs.clear(); addDebugLog("紀錄已重置") },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray),
+                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp, start = 24.dp, end = 24.dp)) {
+                    Text("清空紀錄", fontSize = 12.sp)
+                }
             }
         }
     }
-}
 
-class MainViewModel(context: Context) : ViewModel() {
-    private val prefs = context.getSharedPreferences("sensor_log_prefs", Context.MODE_PRIVATE)
+    // ==========================================
+    // 🛠️ 感測器邏輯 (Sensor Core)
+    // ==========================================
 
-    init {
-        SensorDataManager.init(context)
-    }
-
-    val latestSensorValues = SensorDataManager.latestSensorValues
-    val sensorHistory = SensorDataManager.sensorHistory
-    val lastUpdateTime = SensorDataManager.lastUpdateTime
-    val consoleLogs = SensorDataManager.consoleLogs
-    val debugLogs = SensorDataManager.debugLogs
-    val logGroups = SensorDataManager.logGroups
-
-    val serverUrl = SensorDataManager.serverUrl
-    val urlHistory = SensorDataManager.urlHistory
-
-    val showSensorLog = SensorDataManager.showSensorLog
-    val isAutoUpload = SensorDataManager.isAutoUpload
-
-    fun addDebugLog(message: String) = SensorDataManager.addDebugLog(message)
-
-    fun saveUrl(newUrl: String) {
-        if (newUrl.isBlank()) return
-        serverUrl.value = newUrl
-        if (!urlHistory.contains(newUrl)) urlHistory.add(newUrl)
-        prefs.edit {
-            putString("current_url", newUrl)
-            putStringSet("url_history_set", urlHistory.toSet())
+    override fun onSensorChanged(event: SensorEvent) {
+        // 處理佩戴偵測
+        if (event.sensor.type == Sensor.TYPE_LOW_LATENCY_OFFBODY_DETECT) {
+            isDeviceWorn = (event.values[0].toInt() == 1)
+            return
         }
-        SensorDataManager.addConsoleLog("伺服器變更: $newUrl")
+
+        // 僅更新介面上的名稱，實際數據發送由 SensorService 負責
+        lastActiveSensorName = event.sensor.name
     }
 
-    fun deleteUrl(target: String) {
-        urlHistory.remove(target)
-        prefs.edit { putStringSet("url_history_set", urlHistory.toSet()) }
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+    private fun registerSensorsForUI() {
+        // 在介面開啟時，監聽所有感測器以呈現活動狀態
+        val allSensors = sensorManager.getSensorList(Sensor.TYPE_ALL)
+        for (sensor in allSensors) {
+            // UI 呈現使用較慢的頻率以省電
+            sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+        }
+        offBodySensor?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL) }
     }
 
-    fun clearDebugLogs() {
-        debugLogs.clear()
-        addDebugLog("系統: 指令紀錄已重置")
+    /**
+     * 權限檢查與請求
+     */
+    private fun checkAndRequestPermissions() {
+        val permissions = mutableListOf(
+            Manifest.permission.BODY_SENSORS
+        )
+        // Android 13+ 健康數據權限
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add("android.permission.health.READ_HEART_RATE")
+            permissions.add(Manifest.permission.BODY_SENSORS_BACKGROUND)
+        }
+
+        val missingPermissions = permissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missingPermissions.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, missingPermissions.toTypedArray(), 101)
+        }
     }
 
-    fun mergeAllData() = SensorDataManager.mergeAllData()
-    val mergedReports = SensorDataManager.mergedReports
-    val dataAvailability = SensorDataManager.dataAvailability
+    // ==========================================
+    // 📡 數據通訊 (Communication)
+    // ==========================================
+
+    /**
+     * 發送字串訊息到手機端
+     */
+    private fun sendToPhone(message: String) {
+        Wearable.getNodeClient(this).connectedNodes.addOnSuccessListener { nodes ->
+            for (node in nodes) {
+                Wearable.getMessageClient(this).sendMessage(node.id, "/all_sensors_data", message.toByteArray())
+            }
+        }
+    }
+
+    /**
+     * 宣告硬體身分資訊 (符合 v1.2 規範)
+     */
+    private fun sendIdentityToPhone() {
+        val model = Build.MODEL
+        val fingerprint = Build.FINGERPRINT
+        val message = "INFO|WatchHardware|$model|$fingerprint"
+        sendToPhone(message)
+        addDebugLog("已同步設備身分至手機")
+    }
+
+    /**
+     * 將感測器清單同步至手機
+     */
+    private fun sendSensorListToPhone() {
+        val list = sensorManager.getSensorList(Sensor.TYPE_ALL).joinToString("\n") { it.name }
+        sendToPhone("LOG|SENSOR_LIST|$list")
+        addDebugLog("感測器清單同步成功")
+    }
+
+    /**
+     * 內部輔助：新增除錯日誌
+     */
+    private fun addDebugLog(msg: String) {
+        val time = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        debugLogs.add(0, "[$time] $msg")
+        if (debugLogs.size > 20) debugLogs.removeAt(20)
+    }
 }
